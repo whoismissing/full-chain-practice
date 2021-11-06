@@ -456,6 +456,49 @@ We can save the original pointer for the TypedArray we use in the arbitrary-addr
 
 The sandbox escape will use the vulnerability introduced by [sbx_bug.patch](sbx_bug.patch) which adds a new interface feature to mojo named `CtfInterface`.
 
+The new interface has three methods we can access:
+```
+interface CtfInterface {
+  ResizeVector(uint32 size) => ();
+  Read(uint32 offset) => (double value);
+  Write(double value, uint32 offset) => ();
+};
+```
+
+In `ResizeVector`, we can allocate an arbitrary size.
+```
+void CtfInterfaceImpl::ResizeVector(uint32_t size,
+                                    ResizeVectorCallback callback) {
+  numbers_.resize(size);
+  std::move(callback).Run();
+}
+```
+
+In `Read` and `Write`, if you follow the `offset` function argument, we have an out-of-bounds index access in an array.
+```
+void CtfInterfaceImpl::Read(uint32_t offset, ReadCallback callback) {
+  std::move(callback).Run(numbers_[offset]);
+}
+void CtfInterfaceImpl::Write(double value,
+                             uint32_t offset,
+                             WriteCallback callback) {
+  numbers_[offset] = value;
+  std::move(callback).Run();
+}
+```
+
+With arbitrary size allocation, we can spray `CtfInterface` objects that we control into memory along with a vector of the same size.
+
+We search for a magic value that we put to indicate we are at the right offset in memory.
+
+Then we can use our out-of-bounds access on the same-sized vector and other objects that might also be in nearby memory.
+
+Using our out-of-bounds write, we can overwrite the element pointer in the `std::vector` object to achieve arbitrary-address-read and arbitrary-address-write primitives.
+
+C++ objects implement methods with virtual function tables. We can achieve program-counter control and redirect control flow by overwriting a vtable pointer.
+
+Then, when the corrupted object's vtable method is triggered, we will stack pivot to execute a ROP chain. A useful ROP chain is to call mprotect on memory to make it executable, then execute that memory as shellcode to support arbitrary payloads.
+
 **Privilege escalation**
 
 
